@@ -1,0 +1,151 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function acct(u) { return get(/databases/$(database)/documents/accounts/$(u)).data; }
+    function owns(u) { return signedIn() && acct(u).uid == request.auth.uid; }
+    function admin() { return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)); }
+    function lockExists() { return exists(/databases/$(database)/documents/adminlock/lock); }
+    // the CEO is the person who claimed the one-time admin lock
+    function ceo() { return signedIn() && lockExists() && get(/databases/$(database)/documents/adminlock/lock).data.uid == request.auth.uid; }
+    function isAdminUid(u) { return exists(/databases/$(database)/documents/admins/$(u)); }
+    function grp(g) { return get(/databases/$(database)/documents/groups/$(g)).data; }
+    // can announce / post as the group: owner, label, managers, accepted artists
+    function poster(g, u) {
+      let d = grp(g);
+      return admin() || d.by == u || d.get('label', '') == u || (u in d.get('managers', [])) || (u in d.get('artists', []));
+    }
+    // can manage the group: owner, label, managers
+    function manager(g) {
+      let d = grp(g);
+      return admin() || request.auth.uid == d.uid || request.auth.uid == d.get('labelUid', '') || (request.auth.uid in d.get('managerUids', []));
+    }
+
+    // one-time admin claim: needs the setup code, only works while no lock exists
+    match /adminlock/{id} {
+      allow read: if true;
+      allow create: if id == 'lock' && signedIn() && request.resource.data.uid == request.auth.uid && request.resource.data.code == 'CHANGE_THIS_SETUP_CODE';
+    }
+    match /admins/{id} {
+      allow read: if signedIn() && (request.auth.uid == id || admin());
+      // first-time claim with the setup code, OR the CEO promoting someone
+      allow create: if (signedIn() && request.auth.uid == id
+          && !lockExists()
+          && existsAfter(/databases/$(database)/documents/adminlock/lock)
+          && getAfter(/databases/$(database)/documents/adminlock/lock).data.uid == request.auth.uid)
+        || (ceo() && id != request.auth.uid);
+      // only the CEO can remove an admin (and never themselves)
+      allow delete: if ceo() && id != request.auth.uid;
+    }
+    // private contact details (email): own doc, or admins
+    match /private/{id} {
+      allow read: if signedIn() && (request.auth.uid == id || admin());
+      allow create, update: if signedIn() && request.auth.uid == id;
+    }
+    // emails to the CEO (needs the Trigger Email extension to actually send)
+    match /mail/{id} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['to', 'message'])
+        && request.resource.data.to == ['GroupConncted@outlook.com']
+        && request.resource.data.message.keys().hasOnly(['subject', 'text']);
+    }
+    match /uids/{id} {
+      allow read: if signedIn() && request.auth.uid == id;
+      allow create: if signedIn() && request.auth.uid == id && !exists(/databases/$(database)/documents/banned/$(id));
+      allow delete: if admin() || (signedIn() && request.auth.uid == id);
+    }
+    match /banned/{id} {
+      allow read: if signedIn() && request.auth.uid == id;
+      allow create: if admin() && id != request.auth.uid && (!isAdminUid(id) || ceo());
+    }
+    match /accounts/{u} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid && request.resource.data.role in ['fan', 'artist', 'label'] && (u != 'ceo' || admin()) && !exists(/databases/$(database)/documents/banned/$(request.auth.uid));
+      allow update: if signedIn() && resource.data.uid == request.auth.uid && request.resource.data.uid == resource.data.uid && request.resource.data.role == resource.data.role
+        && (resource.data.role != 'fan' || admin() || request.resource.data.get('links', []) == resource.data.get('links', []));
+      allow delete: if (admin() && (!isAdminUid(resource.data.uid) || ceo())) || (signedIn() && resource.data.uid == request.auth.uid);
+    }
+    match /labels/{u} {
+      allow read: if true;
+      allow create, update: if owns(u) && request.resource.data.u == u && acct(u).role == 'label';
+      allow delete: if owns(u) || admin();
+    }
+    match /groups/{g} {
+      allow read: if true;
+      allow create: if owns(request.resource.data.by) && request.resource.data.uid == request.auth.uid
+        && (request.resource.data.get('approved', false) == false || admin())
+        && (acct(request.resource.data.by).role != 'fan' || admin())
+        && (request.resource.data.label == '' || (acct(request.resource.data.label).role == 'label' && acct(request.resource.data.label).uid == request.resource.data.labelUid));
+      allow update: if signedIn()
+        && (admin() || request.auth.uid == resource.data.uid || request.auth.uid == resource.data.get('labelUid', '') || (request.auth.uid in resource.data.get('managerUids', [])))
+        && (request.resource.data.get('approved', true) == resource.data.get('approved', true) || admin())
+        && request.resource.data.by == resource.data.by
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.get('label', '') == resource.data.get('label', '')
+        && request.resource.data.get('labelUid', '') == resource.data.get('labelUid', '');
+      allow delete: if admin() || (signedIn() && (request.auth.uid == resource.data.uid || request.auth.uid == resource.data.get('labelUid', '')));
+    }
+    match /requests/{id} {
+      allow read: if signedIn() && (resource.data.uid == request.auth.uid || resource.data.labelUid == request.auth.uid || manager(resource.data.gid));
+      allow create: if owns(request.resource.data.u) && request.resource.data.uid == request.auth.uid && request.resource.data.status == 'pending';
+      allow update: if signedIn() && manager(resource.data.gid);
+      allow delete: if owns(resource.data.u) || admin();
+    }
+    match /wall/{id} { allow read: if signedIn(); allow create: if owns(request.resource.data.u); allow delete: if owns(resource.data.u) || admin(); }
+    match /tracks/{id} {
+      allow read: if signedIn();
+      allow create: if owns(request.resource.data.by) && (acct(request.resource.data.by).role == 'label' || admin());
+      allow delete: if owns(resource.data.by) || admin();
+    }
+    match /musicreq/{id} {
+      allow read: if signedIn();
+      allow create: if owns(request.resource.data.u) && acct(request.resource.data.u).role != 'fan';
+      allow update: if admin() || (owns(request.resource.data.doneBy) && acct(request.resource.data.doneBy).role == 'label');
+      allow delete: if owns(resource.data.u) || admin();
+    }
+    match /saves/{id} {
+      allow read, delete: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+    }
+    match /reposts/{id} {
+      allow read: if signedIn();
+      allow create: if owns(request.resource.data.u);
+      allow delete: if owns(resource.data.u) || admin();
+    }
+    match /lives/{id} {
+      allow read: if signedIn();
+      allow create, update: if owns(request.resource.data.by) && poster(id, request.resource.data.by);
+    }
+    match /livechat/{id} {
+      allow read: if signedIn();
+      allow create: if owns(request.resource.data.u);
+      allow delete: if admin();
+    }
+    match /joins/{id} { allow read: if signedIn(); allow create: if owns(request.resource.data.u); allow delete: if owns(resource.data.u) || admin(); }
+    match /posts/{id} {
+      allow read: if signedIn();
+      allow create: if owns(request.resource.data.u) && (request.resource.data.kind == 'fan' || poster(request.resource.data.gid, request.resource.data.u));
+      allow delete: if owns(resource.data.u) || admin();
+    }
+    match /comments/{id} { allow read: if signedIn(); allow create: if owns(request.resource.data.u); allow delete: if owns(resource.data.u) || admin(); }
+    match /likes/{id} { allow read: if signedIn(); allow create: if owns(request.resource.data.u); allow delete: if owns(resource.data.u) || admin(); }
+    match /votes/{id} { allow read: if signedIn(); allow create, update: if owns(request.resource.data.u); }
+    match /moments/{id} { allow read: if signedIn(); allow create: if owns(request.resource.data.u) && poster(request.resource.data.gid, request.resource.data.u); allow delete: if admin(); }
+    match /polls/{id}   { allow read: if signedIn(); allow create: if owns(request.resource.data.u) && poster(request.resource.data.gid, request.resource.data.u); allow delete: if admin(); }
+    match /events/{id}  { allow read: if signedIn(); allow create: if owns(request.resource.data.u) && poster(request.resource.data.gid, request.resource.data.u); allow delete: if admin(); }
+    match /letters/{id} {
+      allow read: if signedIn() && request.auth.uid in resource.data.involved;
+      allow create: if owns(request.resource.data.from) && request.auth.uid in request.resource.data.involved;
+      allow update: if signedIn() && (request.auth.uid == grp(resource.data.gid).uid || request.auth.uid == grp(resource.data.gid).get('labelUid', ''));
+    }
+    match /dms/{id} {
+      allow read: if signedIn() && request.auth.uid in resource.data.pu;
+      allow create: if owns(request.resource.data.from) && request.auth.uid in request.resource.data.pu;
+    }
+    match /notifs/{id} {
+      allow read, update: if signedIn() && resource.data.tu == request.auth.uid;
+      allow create: if signedIn();
+    }
+    match /follows/{id} { allow read: if signedIn(); allow create: if owns(request.resource.data.a); allow delete: if owns(resource.data.a) || admin(); }
+  }
+}
